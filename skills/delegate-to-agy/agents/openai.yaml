@@ -1,0 +1,6 @@
+interface:
+  display_name: "Giao AGY"
+  short_description: "Giao task cho AGY CLI worker"
+  default_prompt: "Use $delegate-to-agy to hand this task to AGY: "
+policy:
+  allow_implicit_invocation: true

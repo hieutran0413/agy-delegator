@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+dashboard/node_modules/
+dashboard/*.tsbuildinfo
+
+.DS_Store
+distribution/*.zip
+distribution/*.sha256

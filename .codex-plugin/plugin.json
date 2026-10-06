@@ -1,0 +1,26 @@
+{
+  "name": "agy-delegator",
+  "version": "0.2.1",
+  "description": "Hand off coding tasks to AGY CLI with a local live activity dashboard.",
+  "author": {
+    "name": "Hieu Tran"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "AGY Delegator",
+    "shortDescription": "Giao AGY s\u1eeda file",
+    "longDescription": "AGY \u0111\u1ecdc/s\u1eeda file theo h\u01b0\u1edbng d\u1eabn; Codex ch\u1ea1y l\u1ec7nh v\u00e0 ki\u1ec3m tra. Dashboard gi\u1eef l\u1ecbch s\u1eed c\u00f9ng phi\u00ean.",
+    "developerName": "Hieu Tran",
+    "category": "Productivity",
+    "capabilities": [
+      "Local command execution",
+      "Live activity dashboard"
+    ],
+    "defaultPrompt": [
+      "Giao AGY tri\u1ec3n khai task n\u00e0y: ",
+      "Nh\u1edd AGY review c\u00e1c thay \u0111\u1ed5i hi\u1ec7n t\u1ea1i.",
+      "Nh\u1edd AGY \u0111i\u1ec1u tra l\u1ed7i n\u00e0y tr\u01b0\u1edbc: "
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "agy-delegator": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/skills/delegate-to-agy/scripts/agy_mcp.py"
+      ]
+    },
+    "shared-executor": {
+      "type": "stdio",
+      "command": "python3",
+      "args": [
+        "${PLUGIN_ROOT}/skills/delegate-to-agy/scripts/shared_executor.py"
+      ]
+    }
+  }
+}
