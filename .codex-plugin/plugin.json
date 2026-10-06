@@ -1,6 +1,6 @@
 {
   "name": "agy-delegator",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Hand off coding tasks to AGY CLI with a local live activity dashboard.",
   "author": {
     "name": "Hieu Tran"

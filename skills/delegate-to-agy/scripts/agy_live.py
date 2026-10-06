@@ -53,7 +53,7 @@ TERM_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 3.0
 TERMINAL_STATES = {"finished", "failed", "cancelled", "timed_out", "stalled"}
 FORCED_STATES = {"cancelled", "timed_out", "stalled"}
-DASHBOARD_VERSION = 8
+DASHBOARD_VERSION = 9
 # Dashboard mutations (stop / continue). Same-origin only; bounded bodies.
 MAX_MUTATION_BODY = 20000
 MAX_STEER_MESSAGE = 8000
@@ -554,6 +554,7 @@ def snapshot(job_id: str, include_prompt: bool = True) -> dict:
         "reportPath": report_path(directory, metadata, result) if result else None,
         "parentJobId": metadata.get("parentJobId"), "supersededBy": metadata.get("supersededBy"),
         "steerPending": _steer_in_flight(metadata),
+        "autoFallbackError": metadata.get("autoFallbackError"),
         "turnMessage": metadata.get("turnMessage"),
         "userMessages": [
             {"requestId": item.get("requestId"), "message": item.get("message"), "at": item.get("at")}
@@ -1041,6 +1042,7 @@ def launch(args: argparse.Namespace) -> dict:
         "trustedTools": list(agent.TRUSTED_TOOLS), "writeScope": policy["allowedPaths"],
         "maxRuntimeSeconds": max_runtime, "idleTimeoutSeconds": idle_timeout, "supervisorPid": None,
         "originalBrief": brief,
+        "autoQuotaFallback": True, "dashboardPort": args.port,
         # A fresh launch is turn 1 of its own logical task with no session yet.
         "rootTaskId": job_id, "turn": 1, "resumeSessionId": resume_session, "sessionId": None,
     }
@@ -1420,7 +1422,8 @@ def validate_continue_args(message: object, request_id: object, limit: int = MAX
     return message, request_id
 
 
-def continue_job(job_id: str, message: str, request_id: str, port: int = PORT, interrupt: bool = False) -> dict:
+def continue_job(job_id: str, message: str, request_id: str, port: int = PORT, interrupt: bool = False,
+                 fallback_model: str | None = None) -> dict:
     """Send a new user message to the *same* AGY session as a new turn. Codex-owned process control.
 
     The new turn is a fresh ``agy-cli`` process launched with exactly
@@ -1465,6 +1468,11 @@ def continue_job(job_id: str, message: str, request_id: str, port: int = PORT, i
         if not status.get("done") and not interrupt:
             raise ConflictError("Turn " + job_id + " is still " + str(status.get("state"))
                                 + "; wait_job until done (or stop_job) before continuing the session")
+        if fallback_model is not None and (not status.get("done") or status.get("state") != "failed"
+                or fallback_model != next_quota_model(metadata.get("model"), status.get("error"))):
+            raise ConflictError("Model fallback is only allowed after the current model exhausts quota")
+        selected_model = fallback_model or metadata["model"]
+        selected_effort = ("high" if selected_model == "gemini-3.8-flash-high" else None) if fallback_model else metadata.get("effort")
         session_id = resumable_session(job_id)  # explicit blocker; nothing has been stopped yet
         root_id = root_task_id(metadata) or job_id
         turn = turn_number(metadata) + 1
@@ -1487,8 +1495,8 @@ def continue_job(job_id: str, message: str, request_id: str, port: int = PORT, i
                                             + (": " + str(detail) if detail else ""))
                 entry = {"requestId": request_id, "message": message, "at": time.time(), "parentJobId": job_id}
                 launched = launch(argparse.Namespace(
-                    workspace=metadata["workspace"], mode=metadata["mode"], model=metadata["model"],
-                    effort=metadata["effort"], prompt=continuation_message(metadata, status, message, turn),
+                    workspace=metadata["workspace"], mode=metadata["mode"], model=selected_model,
+                    effort=selected_effort, prompt=continuation_message(metadata, status, message, turn),
                     prompt_file=None, port=port, files=files, resume_session_id=session_id, resume_agent=metadata["agent"],
                     max_runtime=metadata.get("maxRuntimeSeconds"), idle_timeout=metadata.get("idleTimeoutSeconds"),
                     extra_metadata={"parentJobId": job_id, "steerRequestId": request_id, "originalBrief": original,
@@ -1575,6 +1583,39 @@ def task_history(job_id: str, offset: int = 0, limit: int = HISTORY_PAGE) -> dic
     }
 
 
+def next_quota_model(model: object, error: object) -> str | None:
+    # Only an explicit model-quota error triggers this user-approved sequence.
+    if not isinstance(error, str) or "individual quota reached" not in error.lower():
+        return None
+    return {
+        "claude-opus-4-6-thinking": "claude-sonnet-4-6",
+        "claude-sonnet-4-6": "gemini-3.8-flash-high",
+    }.get(model)
+
+
+def auto_quota_fallback(job_id: str, status: dict) -> dict | None:
+    metadata = read_json(job_dir(job_id) / "job.json")
+    if (not metadata.get("autoQuotaFallback") or metadata.get("supersededBy")
+            or metadata.get("autoFallbackError") or status.get("state") != "failed"
+            or not status.get("done")):
+        return None
+    model = next_quota_model(metadata.get("model"), status.get("error"))
+    if not model:
+        return None
+    try:
+        return continue_job(
+            job_id,
+            "The previous model exhausted its quota. Continue the unfinished objective using " + model
+            + " in this same conversation. Preserve existing edits, scope and full results. Do not repeat completed work.",
+            "auto-quota-fallback", port=metadata.get("dashboardPort", PORT), fallback_model=model,
+        )
+    except Exception as error:
+        # Fail closed if resume/catalog/scope validation fails. Never start a new
+        # conversation or retry a failed fallback endlessly in the background.
+        update_job(job_id, lambda current: current.update(autoFallbackError=str(error)))
+        return None
+
+
 def serve(args: argparse.Namespace) -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
     ThreadingHTTPServer.allow_reuse_address = True
@@ -1586,6 +1627,15 @@ def serve(args: argparse.Namespace) -> None:
         while not maintenance_stop.is_set():
             try:
                 cleanup_finished_jobs()
+                jobs_root = ROOT / "jobs"
+                if jobs_root.exists():
+                    for directory in jobs_root.iterdir():
+                        if not directory.is_dir():
+                            continue
+                        metadata = read_json(directory / "job.json")
+                        result = read_json(directory / "result.json")
+                        if metadata.get("autoQuotaFallback") and result.get("state") == "failed":
+                            auto_quota_fallback(directory.name, {**result, "done": True})
             except Exception as error:
                 print("AGY Live maintenance failed: " + str(error), file=sys.stderr, flush=True)
             maintenance_stop.wait(60)
@@ -1613,7 +1663,16 @@ def wait_job(job_id: str, timeout_seconds: int = 50) -> dict:
             return {**status, "waitTimedOut": False, "nextAction": "wait_superseding_job",
                     "followJobId": status["supersededBy"]}
         if status.get("done") and not status.get("steerPending"):
-            return {**status, "waitTimedOut": False, "nextAction": "review_result"}
+            successor = auto_quota_fallback(job_id, status)
+            if successor:
+                return {**status, "waitTimedOut": False, "nextAction": "wait_superseding_job",
+                        "followJobId": successor["jobId"], "fallbackModel": next_quota_model(status.get("model"), status.get("error"))}
+            latest = read_json(job_dir(job_id) / "job.json")
+            if latest.get("supersededBy"):
+                return {**status, "waitTimedOut": False, "nextAction": "wait_superseding_job",
+                        "followJobId": latest["supersededBy"]}
+            return {**status, "autoFallbackError": latest.get("autoFallbackError"),
+                    "waitTimedOut": False, "nextAction": "review_result"}
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             return {**status, "waitTimedOut": True, "nextAction": "continue_waiting"}

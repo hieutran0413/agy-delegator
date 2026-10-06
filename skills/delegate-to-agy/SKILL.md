@@ -20,8 +20,13 @@ acceptance criteria and stop conditions.
 For Claude models marked Thinking in `agy models`, omit effort. Those models
 reject an explicit effort value, including low. Other models default to low;
 use high when the user requests Gemini Flash High. A quota error is a failed
-turn, not a reason to discard the session or its partial report. Follow the
-user's approved fallback order; without one, ask which model to use.
+turn, not a reason to discard the session or its partial report. New turns
+automatically resume the same captured conversation on quota exhaustion:
+Opus 4.6 Thinking → Sonnet 4.6 Thinking → Gemini 3.8 Flash High. Gemini uses
+high effort; Claude Thinking omits effort. Follow `followJobId` from wait_job.
+This is only for explicit individual-quota failures, never other errors,
+cancelled turns or historical finished tasks. If resume fails, report
+autoFallbackError; never create a replacement conversation.
 
 Use MCP start_job for a genuinely new task. Or resolve this skill's absolute
 script path and run:
