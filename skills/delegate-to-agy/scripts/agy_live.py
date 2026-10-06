@@ -53,7 +53,7 @@ TERM_GRACE_SECONDS = 5.0
 KILL_GRACE_SECONDS = 3.0
 TERMINAL_STATES = {"finished", "failed", "cancelled", "timed_out", "stalled"}
 FORCED_STATES = {"cancelled", "timed_out", "stalled"}
-DASHBOARD_VERSION = 7
+DASHBOARD_VERSION = 8
 # Dashboard mutations (stop / continue). Same-origin only; bounded bodies.
 MAX_MUTATION_BODY = 20000
 MAX_STEER_MESSAGE = 8000
@@ -599,7 +599,17 @@ def job_catalog() -> list[dict]:
         if not metadata:
             continue
         try:
-            status = snapshot(directory.name, include_prompt=False)
+            result = read_json(directory / "result.json")
+            if result:
+                # Historical terminal jobs need no process probes or log replay.
+                status = {
+                    "state": result["state"],
+                    "rootTaskId": root_task_id(metadata),
+                    "turn": turn_number(metadata),
+                    "sessionId": result.get("sessionId") or metadata.get("sessionId"),
+                }
+            else:
+                status = snapshot(directory.name, include_prompt=False)
         except (OSError, ValueError, KeyError):
             continue
         output.append({
@@ -683,7 +693,6 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        cleanup_finished_jobs()
         if parsed.path == "/health":
             reply(self, {"ok": True, "version": DASHBOARD_VERSION})
             return
@@ -935,13 +944,24 @@ def _seconds(value: object, default: int, label: str) -> int:
 def worker_command(metadata: dict) -> list[str]:
     command = ["agy", "--output-format", "stream-json", "--print-timeout", "0",
                "--disable-slash-commands", "--mode", "accept-edits" if metadata["mode"] == "implement" else "plan",
-               "--agent", metadata["agent"], "--model", metadata["model"], "--effort", metadata["effort"]]
+               "--agent", metadata["agent"], "--model", metadata["model"]]
+    if metadata.get("effort"):
+        command += ["--effort", metadata["effort"]]
     resume = metadata.get("resumeSessionId")
     if resume is not None:
         if not valid_session_id(resume):
             raise ValueError("Invalid conversation ID")
         command += ["--conversation", resume]
     return command + ["--print", metadata["prompt"]]
+
+
+def resolve_effort(model: str, requested: str | None, display_name: str = "") -> str | None:
+    """Thinking models choose their own reasoning level and reject --effort."""
+    if model.endswith("-thinking") or "(Thinking)" in display_name:
+        if requested is not None:
+            raise ValueError("This Thinking model does not accept --effort; omit the effort option")
+        return None
+    return requested or "low"
 
 
 def spawn_supervisor(job_id: str) -> subprocess.Popen:
@@ -991,11 +1011,16 @@ def launch(args: argparse.Namespace) -> dict:
         raise agent.PolicyError("Workspace agent profile would shadow the isolated worker profile: "
                                 + ", ".join(str(path) for path in shadows))
     available = subprocess.run(["agy", "models"], capture_output=True, text=True, timeout=30, check=True)
-    model_ids = {line.split('\t', 1)[0].strip() for line in available.stdout.splitlines() if '\t' in line}
+    model_labels = {}
+    for line in available.stdout.splitlines():
+        parts = line.split('\t', 1)
+        if len(parts) == 2:
+            model_labels[parts[0].strip()] = parts[1].strip()
+    model_ids = set(model_labels)
     if args.model not in model_ids:
         raise RuntimeError("Model unavailable: " + args.model)
+    effort = resolve_effort(args.model, getattr(args, "effort", None), model_labels[args.model])
     ensure_server(args.port)
-    cleanup_finished_jobs()
     directory = job_dir(job_id)
     brief = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file else args.prompt
     executor_policy = read_json(Path.home() / ".local/share/agy-executor/policy.json")
@@ -1011,7 +1036,7 @@ def launch(args: argparse.Namespace) -> dict:
     metadata = {
         "id": job_id, "state": "starting", "pid": None, "mode": args.mode, "workspace": str(workspace),
         "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "createdAt": time.time(),
-        "model": args.model, "effort": args.effort, "prompt": worker_prompt,
+        "model": args.model, "effort": effort, "prompt": worker_prompt,
         "agent": name, "agentFile": str(agent_file), "tools": policy["tools"],
         "trustedTools": list(agent.TRUSTED_TOOLS), "writeScope": policy["allowedPaths"],
         "maxRuntimeSeconds": max_runtime, "idleTimeoutSeconds": idle_timeout, "supervisorPid": None,
@@ -1433,7 +1458,7 @@ def continue_job(job_id: str, message: str, request_id: str, port: int = PORT, i
             raise ConflictError("Job " + job_id + " was already continued in " + str(metadata["supersededBy"])
                                 + "; continue the latest turn instead")
         files = steer_files(metadata)  # validate before stopping anything
-        for key in ("mode", "model", "effort"):
+        for key in ("mode", "model"):
             if not metadata.get(key):
                 raise ConflictError("Job record is missing " + key + "; cannot continue it")
         status = snapshot(job_id, include_prompt=False)
@@ -1554,12 +1579,25 @@ def serve(args: argparse.Namespace) -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
     ThreadingHTTPServer.allow_reuse_address = True
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    maintenance_stop = threading.Event()
+
+    def maintain() -> None:
+        # Retention must not delay health requests, assets or worker startup.
+        while not maintenance_stop.is_set():
+            try:
+                cleanup_finished_jobs()
+            except Exception as error:
+                print("AGY Live maintenance failed: " + str(error), file=sys.stderr, flush=True)
+            maintenance_stop.wait(60)
+
+    threading.Thread(target=maintain, name="agy-live-maintenance", daemon=True).start()
     print("AGY Live listening on http://127.0.0.1:" + str(args.port), flush=True)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
         pass
     finally:
+        maintenance_stop.set()
         server.server_close()
 
 
@@ -1592,7 +1630,8 @@ def main() -> int:
     brief.add_argument("--prompt")
     brief.add_argument("--prompt-file", help="UTF-8 brief file; avoids shell interpolation")
     launch.add_argument("--model", default="gemini-3.8-flash-low")
-    launch.add_argument("--effort", default="low", choices=("low", "medium", "high"))
+    launch.add_argument("--effort", default=None, choices=("low", "medium", "high"),
+                        help="Reasoning effort; omitted for Thinking models and defaults to low otherwise")
     launch.add_argument("--port", type=int, default=PORT)
     launch.add_argument("--file", dest="files", action="append", default=None,
                         help="Implement mode: restrict writes to this workspace file (repeatable)")

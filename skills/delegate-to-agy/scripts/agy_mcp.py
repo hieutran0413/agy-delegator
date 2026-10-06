@@ -23,7 +23,7 @@ FILES = {"type": "array", "items": {"type": "string"}, "maxItems": 200,
          "description": "Implement mode only: workspace-relative files AGY may write. Omit to request workspace edits; scope is prompt-based, not OS enforcement."}
 TOOLS = [
     {"name": "list_models", "description": "List available AGY models; does not launch a worker.", "inputSchema": schema({})},
-    {"name": "start_job", "description": "Launch one bounded file-only task in a brand-new, unrelated AGY session (never resumes any existing session; use continue_job to keep the conversation). Launch is not completion: keep calling wait_job until done=true, then review the result before ending the response. AGY cannot execute terminal commands. File scope is an instruction boundary, not an OS sandbox. A Codex-owned supervisor enforces max runtime and idle timeout. Never opens a browser.", "inputSchema": schema({"workspace": STR, "mode": {"type": "string", "enum": ["review", "implement"]}, "model": STR, "effort": {"type": "string", "enum": ["low", "medium", "high"]}, "brief": STR, "files": FILES, "max_runtime_seconds": SECONDS, "idle_timeout_seconds": SECONDS}, ["workspace", "mode", "model", "effort", "brief"])},
+    {"name": "start_job", "description": "Launch one bounded file-only task in a brand-new, unrelated AGY session (Thinking models use their built-in reasoning level; omit effort), never resumes any existing session (use continue_job to keep the conversation). Launch is not completion: keep calling wait_job until done=true, then review the result before ending the response. AGY cannot execute terminal commands. File scope is an instruction boundary, not an OS sandbox. A Codex-owned supervisor enforces max runtime and idle timeout. Never opens a browser.", "inputSchema": schema({"workspace": STR, "mode": {"type": "string", "enum": ["review", "implement"]}, "model": STR, "effort": {"type": "string", "enum": ["low", "medium", "high"]}, "brief": STR, "files": FILES, "max_runtime_seconds": SECONDS, "idle_timeout_seconds": SECONDS}, ["workspace", "mode", "model", "brief"])},
     {"name": "continue_job", "description": "Send a new message to the SAME AGY session as a finished turn (e.g. command output/test results Codex ran, or follow-up instructions). Starts a new turn with exactly --conversation of that turn's captured sessionId, same mode/model/effort/limits and identical write scope, still code-only. Returns the new turn's jobId; wait_job on it. Fails with an explicit blocker (and starts nothing) if the session id is unknown or unavailable, if the turn is still running, or if it was already continued. request_id makes retries idempotent.", "inputSchema": schema({"job_id": STR, "message": {"type": "string", "minLength": 1, "maxLength": live.MAX_CONTINUE_MESSAGE}, "request_id": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,80}$"}}, ["job_id", "message", "request_id"])},
     {"name": "task_history", "description": "Ordered turns of the logical task (same rootTaskId) containing job_id: per turn jobId, turn, sessionId, state, the message sent, the complete raw report and reportPath. Paginate with offset/limit (nextOffset is null on the last page).", "inputSchema": schema({"job_id": STR, "offset": {"type": "integer", "minimum": 0, "maximum": 100000}, "limit": {"type": "integer", "minimum": 1, "maximum": live.MAX_HISTORY_PAGE}}, ["job_id"])},
     {"name": "job_status", "description": "Get compact status, report and error for one job. 'done' is true only for a durable terminal result; 'processAlive' reports the actual worker process. Includes sessionId, rootTaskId and turn.", "inputSchema": schema({"job_id": STR}, ["job_id"])},
@@ -64,7 +64,7 @@ def call(name, args):
     with contextlib.redirect_stdout(io.StringIO()):
         if name == "start_job":
             return live.launch(argparse.Namespace(
-                workspace=args["workspace"], mode=args["mode"], model=args["model"], effort=args["effort"],
+                workspace=args["workspace"], mode=args["mode"], model=args["model"], effort=args.get("effort"),
                 prompt=args["brief"], prompt_file=None, port=live.PORT, files=args.get("files"),
                 max_runtime=args.get("max_runtime_seconds"), idle_timeout=args.get("idle_timeout_seconds"),
             ))
@@ -84,7 +84,7 @@ def call(name, args):
 def dispatch(request):
     method = request.get("method")
     if method == "initialize":
-        return {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "agy-delegator", "version": "0.2.0"}}
+        return {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "agy-delegator", "version": "0.2.2"}}
     if method == "ping":
         return {}
     if method == "tools/list":
